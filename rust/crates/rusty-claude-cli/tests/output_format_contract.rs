@@ -375,8 +375,17 @@ fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str
 fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(current_dir).args(args);
+    let mut home_in_envs = false;
     for (key, value) in envs {
+        if *key == "HOME" {
+            home_in_envs = true;
+        }
         command.env(key, value);
+    }
+    if !home_in_envs && std::env::var_os("HOME").is_none() {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            command.env("HOME", profile);
+        }
     }
     command.output().expect("claw should launch")
 }

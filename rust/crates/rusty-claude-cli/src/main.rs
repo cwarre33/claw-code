@@ -24,10 +24,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    detect_provider_kind, max_tokens_for_model, oauth_token_is_expired, resolve_startup_auth_source,
+    AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -56,11 +56,42 @@ use serde_json::{json, Map, Value};
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
-fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
+
+/// Completion budget for OpenAI-compatible APIs (NIM, xAI, etc.). Total context is finite;
+/// asking for 64k completion on an 8k-context model yields 400 from NVIDIA.
+fn openai_compatible_completion_max_tokens(model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("340b")
+        || m.contains("405b")
+        || m.contains("nemotron-4")
+        || m.contains("120b")
+        || m.contains("nemotron-3")
+    {
+        return 16_384;
+    }
+    if m.contains("70b") || m.contains("72b") || m.contains("8x22b") {
+        return 8_192;
+    }
+    if m.contains("8x7b") || m.contains("mixtral-8x") {
+        return 8_192;
+    }
+    if m.contains("8b") || m.contains("7b") || m.contains("mini") || m.contains("small") {
+        return 2_048;
+    }
+    4_096
+}
+
+fn completion_max_tokens_for_request(model: &str) -> u32 {
+    if let Ok(raw) = env::var("CLAW_MAX_COMPLETION_TOKENS") {
+        if let Ok(n) = raw.trim().parse::<u32>() {
+            if (1..=200_000).contains(&n) {
+                return n;
+            }
+        }
+    }
+    match detect_provider_kind(model) {
+        ProviderKind::Anthropic => max_tokens_for_model(model),
+        ProviderKind::OpenAi | ProviderKind::Xai => openai_compatible_completion_max_tokens(model),
     }
 }
 const DEFAULT_DATE: &str = "2026-03-31";
@@ -87,6 +118,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--resume",
     "--print",
     "-p",
+    "--no-tools",
 ];
 
 type AllowedToolSet = BTreeSet<String>;
@@ -156,7 +188,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
+            enable_tools,
+        } => LiveCli::new(model, enable_tools, allowed_tools, permission_mode)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -166,7 +199,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            enable_tools,
+        } => run_repl(model, allowed_tools, permission_mode, enable_tools)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -225,6 +259,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        enable_tools: bool,
     },
     Login {
         output_format: CliOutputFormat,
@@ -242,6 +277,7 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        enable_tools: bool,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -283,6 +319,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
+    let mut enable_tools = true;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -333,6 +370,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
+            "--no-tools" => {
+                enable_tools = false;
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -346,6 +387,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
                         .unwrap_or_else(default_permission_mode),
+                    enable_tools,
                 });
             }
             "--print" => {
@@ -403,6 +445,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            enable_tools,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -439,6 +482,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     output_format,
                     allowed_tools,
                     permission_mode,
+                    enable_tools,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -461,6 +505,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                enable_tools,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -469,6 +514,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            enable_tools,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -476,6 +522,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            enable_tools,
         }),
     }
 }
@@ -565,6 +612,7 @@ fn parse_direct_slash_cli_action(
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    enable_tools: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -590,6 +638,7 @@ fn parse_direct_slash_cli_action(
                     output_format,
                     allowed_tools,
                     permission_mode,
+                    enable_tools,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -2441,8 +2490,9 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    enable_tools: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(model, enable_tools, allowed_tools, permission_mode)?;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -2504,6 +2554,7 @@ struct ManagedSessionSummary {
 
 struct LiveCli {
     model: String,
+    enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
@@ -3005,6 +3056,7 @@ impl LiveCli {
         )?;
         let cli = Self {
             model,
+            enable_tools,
             allowed_tools,
             permission_mode,
             system_prompt,
@@ -3080,7 +3132,7 @@ impl LiveCli {
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
-            true,
+            self.enable_tools,
             emit_output,
             self.allowed_tools.clone(),
             self.permission_mode,
@@ -5571,7 +5623,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -5591,11 +5643,17 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let resolved = api::resolve_model_alias(&model);
+        let anthropic_auth = match detect_provider_kind(&resolved) {
+            ProviderKind::Anthropic => Some(resolve_cli_auth_source()?),
+            _ => None,
+        };
+        let client = ProviderClient::from_model_with_anthropic_auth(&model, anthropic_auth)
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+            .with_prompt_cache(PromptCache::new(session_id));
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -5641,7 +5699,7 @@ impl ApiClient for AnthropicRuntimeClient {
         }
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: completion_max_tokens_for_request(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
@@ -6550,7 +6608,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -7243,6 +7301,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                enable_tools: true,
             }
         );
     }
@@ -7404,6 +7463,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                enable_tools: true,
             }
         );
     }
@@ -7427,6 +7487,7 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                enable_tools: true,
             }
         );
     }
@@ -7449,6 +7510,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                enable_tools: true,
             }
         );
     }
@@ -7486,6 +7548,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                enable_tools: true,
             }
         );
     }
@@ -7494,13 +7557,16 @@ mod tests {
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp cwd");
         let args = vec![
             "--allowedTools".to_string(),
             "read,glob".to_string(),
             "--allowed-tools=write_file".to_string(),
         ];
+        let parsed = with_current_dir(&root, || parse_args(&args)).expect("args should parse");
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parsed,
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: Some(
@@ -7510,6 +7576,7 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
+                enable_tools: true,
             }
         );
     }
@@ -7600,6 +7667,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                enable_tools: true,
             }
         );
         assert_eq!(
@@ -7707,6 +7775,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                enable_tools: true,
             }
         );
     }
@@ -7771,6 +7840,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                enable_tools: true,
             }
         );
         assert_eq!(
@@ -7794,6 +7864,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                enable_tools: true,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -9091,6 +9162,7 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(source_root);
     }
 
+    #[cfg(unix)]
     #[test]
     #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
@@ -9100,6 +9172,8 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
+        let script_arg =
+            serde_json::to_string(script_path.to_str().expect("utf8 script path")).expect("json");
         fs::write(
             config_home.join("settings.json"),
             format!(
@@ -9107,15 +9181,14 @@ UU conflicted.rs",
                   "mcpServers": {{
                     "alpha": {{
                       "command": "python3",
-                      "args": ["{}"]
+                      "args": [{script_arg}]
                     }},
                     "broken": {{
                       "command": "python3",
                       "args": ["-c", "import sys; sys.exit(0)"]
                     }}
                   }}
-                }}"#,
-                script_path.to_string_lossy()
+                }}"#
             ),
         )
         .expect("write mcp settings");
@@ -9261,6 +9334,7 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[cfg(unix)]
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         let config_home = temp_dir();

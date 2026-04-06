@@ -1,3 +1,8 @@
+.env
+# Local claw sessions / config
+.claw/
+rust/.claw/
+**/crates/claw-cli/.claw/
 __pycache__/
 archive/
 .omx/
