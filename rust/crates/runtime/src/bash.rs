@@ -1,5 +1,7 @@
 use std::env;
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -32,6 +34,9 @@ pub struct BashCommandInput {
     pub filesystem_mode: Option<FilesystemIsolationMode>,
     #[serde(rename = "allowedMounts")]
     pub allowed_mounts: Option<Vec<String>>,
+    /// Process working directory for `sh -lc` (CLI-injected; persists `cd` across tool calls).
+    #[serde(default, rename = "workingDirectory", skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
 }
 
 /// Output returned from a bash tool invocation.
@@ -66,13 +71,35 @@ pub struct BashCommandOutput {
     pub sandbox_status: Option<SandboxStatus>,
 }
 
+fn resolve_shell_cwd(input: &BashCommandInput, workspace_root: &Path) -> PathBuf {
+    let shell_cwd = match &input.working_directory {
+        Some(s) if !s.trim().is_empty() => {
+            let p = PathBuf::from(s.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                workspace_root.join(p)
+            }
+        }
+        _ => workspace_root.to_path_buf(),
+    };
+    fs::canonicalize(&shell_cwd).unwrap_or(shell_cwd)
+}
+
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
-    let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    let workspace_root = env::current_dir()?;
+    let shell_cwd = resolve_shell_cwd(&input, &workspace_root);
+    let sandbox_status = sandbox_status_for_input(&input, &workspace_root);
 
     if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let mut child = prepare_command(
+            &input.command,
+            &shell_cwd,
+            &workspace_root,
+            &sandbox_status,
+            false,
+        );
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -99,15 +126,27 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    runtime.block_on(execute_bash_async(
+        input,
+        sandbox_status,
+        workspace_root,
+        shell_cwd,
+    ))
 }
 
 async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
-    cwd: std::path::PathBuf,
+    workspace_root: PathBuf,
+    shell_cwd: PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let mut command = prepare_tokio_command(
+        &input.command,
+        &shell_cwd,
+        &workspace_root,
+        &sandbox_status,
+        true,
+    );
 
     let output_result = if let Some(timeout_ms) = input.timeout {
         match timeout(Duration::from_millis(timeout_ms), command.output()).await {
@@ -184,54 +223,56 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
 
 fn prepare_command(
     command: &str,
-    cwd: &std::path::Path,
+    shell_cwd: &Path,
+    workspace_root: &Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
 ) -> Command {
     if create_dirs {
-        prepare_sandbox_dirs(cwd);
+        prepare_sandbox_dirs(workspace_root);
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+    if let Some(launcher) = build_linux_sandbox_command(command, workspace_root, sandbox_status) {
         let mut prepared = Command::new(launcher.program);
         prepared.args(launcher.args);
-        prepared.current_dir(cwd);
+        prepared.current_dir(shell_cwd);
         prepared.envs(launcher.env);
         return prepared;
     }
 
     let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    prepared.arg("-lc").arg(command).current_dir(shell_cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        prepared.env("HOME", workspace_root.join(".sandbox-home"));
+        prepared.env("TMPDIR", workspace_root.join(".sandbox-tmp"));
     }
     prepared
 }
 
 fn prepare_tokio_command(
     command: &str,
-    cwd: &std::path::Path,
+    shell_cwd: &Path,
+    workspace_root: &Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
 ) -> TokioCommand {
     if create_dirs {
-        prepare_sandbox_dirs(cwd);
+        prepare_sandbox_dirs(workspace_root);
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+    if let Some(launcher) = build_linux_sandbox_command(command, workspace_root, sandbox_status) {
         let mut prepared = TokioCommand::new(launcher.program);
         prepared.args(launcher.args);
-        prepared.current_dir(cwd);
+        prepared.current_dir(shell_cwd);
         prepared.envs(launcher.env);
         return prepared;
     }
 
     let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    prepared.arg("-lc").arg(command).current_dir(shell_cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        prepared.env("HOME", workspace_root.join(".sandbox-home"));
+        prepared.env("TMPDIR", workspace_root.join(".sandbox-tmp"));
     }
     prepared
 }
@@ -258,6 +299,7 @@ mod tests {
             isolate_network: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: None,
+            working_directory: None,
         })
         .expect("bash command should execute");
 
@@ -278,6 +320,7 @@ mod tests {
             isolate_network: None,
             filesystem_mode: None,
             allowed_mounts: None,
+            working_directory: None,
         })
         .expect("bash command should execute");
 

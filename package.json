@@ -1,0 +1,10 @@
+{
+  "name": "claw-code",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "clawde": "bun run ./packages/claw-ui/src/cli.ts",
+    "claw-ui": "bun run ./packages/claw-ui/src/cli.ts",
+    "install-global": "bun run scripts/install-global.ts"
+  }
+}

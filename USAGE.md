@@ -71,6 +71,26 @@ cd rust
 ./target/debug/claw --output-format json prompt "status"
 ```
 
+### Continue the latest saved session
+
+Use **`--continue`** with prompt mode so `claw` loads the most recent managed session under `.claw/sessions/` instead of starting a new one (useful for scripts and the Bun UI in `packages/claw-ui/`, which defaults to a **`clawde`** engine command; set **`CLAW_BINARY`** if your binary is still named `claw`).
+
+### Global `clawde` command (Bun UI)
+
+From the `claw-code` directory, link the CLI once so **`clawde`** works everywhere (Bun installs the shim under `~/.bun/bin` or `%USERPROFILE%\.bun\bin`):
+
+```bash
+bun run install-global
+```
+
+Or run `scripts/install-clawde-global.ps1` (Windows) / `scripts/install-clawde-global.sh` (Unix). Open a **new** terminal after linking. See [`packages/claw-ui/README.md`](./packages/claw-ui/README.md).
+
+```bash
+cd rust
+./target/debug/claw --continue "what did we decide about CI?"
+./target/debug/claw --output-format json --continue -p "next step"
+```
+
 ## Model and permission controls
 
 ```bash

@@ -1,0 +1,22 @@
+{
+  "name": "clawde",
+  "version": "0.1.0",
+  "description": "Interactive Bun shell for the Claw agent (clack prompts → engine CLI)",
+  "type": "module",
+  "bin": {
+    "clawde": "./src/cli.ts",
+    "claw-ui": "./src/cli.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "start": "bun run src/cli.ts"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.10.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}

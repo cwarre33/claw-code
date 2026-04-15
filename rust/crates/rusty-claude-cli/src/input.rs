@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::env;
 use std::io::{self, IsTerminal, Write};
 
 use rustyline::completion::{Completer, Pair};
@@ -86,13 +87,32 @@ impl Hinter for SlashCommandHelper {
 impl Highlighter for SlashCommandHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         self.set_current_line(line);
-        Cow::Borrowed(line)
+        if !ansi_color_enabled() || !line.starts_with('/') {
+            return Cow::Borrowed(line);
+        }
+        let first_space = line.find(' ').unwrap_or(line.len());
+        let (cmd, rest) = line.split_at(first_space);
+        let mut styled = String::with_capacity(line.len() + 32);
+        styled.push_str("\x1b[36m");
+        styled.push_str(cmd);
+        styled.push_str("\x1b[0m");
+        if !rest.is_empty() {
+            styled.push_str("\x1b[2m");
+            styled.push_str(rest);
+            styled.push_str("\x1b[0m");
+        }
+        Cow::Owned(styled)
     }
 
     fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
         self.set_current_line(line);
-        false
+        line.starts_with('/')
     }
+}
+
+fn ansi_color_enabled() -> bool {
+    env::var_os("NO_COLOR").is_none()
+        && env::var_os("CLICOLOR").map_or(true, |value| value != "0")
 }
 
 impl Validator for SlashCommandHelper {}

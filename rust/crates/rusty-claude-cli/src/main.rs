@@ -49,7 +49,7 @@ use runtime::{
     ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
     OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    BashCommandOutput, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -119,6 +119,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--print",
     "-p",
     "--no-tools",
+    "--continue",
 ];
 
 type AllowedToolSet = BTreeSet<String>;
@@ -189,8 +190,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             enable_tools,
-        } => LiveCli::new(model, enable_tools, allowed_tools, permission_mode)?
-            .run_turn_with_output(&prompt, output_format)?,
+            continue_session,
+        } => {
+            let mut cli = if continue_session {
+                LiveCli::from_latest_session(model, enable_tools, allowed_tools, permission_mode)?
+            } else {
+                LiveCli::new(model, enable_tools, allowed_tools, permission_mode)?
+            };
+            cli.run_turn_with_output(&prompt, output_format)?;
+        }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
@@ -260,6 +268,8 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         enable_tools: bool,
+        /// Load the latest managed session from `.claw/sessions/` instead of starting fresh.
+        continue_session: bool,
     },
     Login {
         output_format: CliOutputFormat,
@@ -320,6 +330,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
     let mut enable_tools = true;
+    let mut continue_session = false;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -374,6 +385,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 enable_tools = false;
                 index += 1;
             }
+            "--continue" => {
+                continue_session = true;
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -388,6 +403,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode: permission_mode_override
                         .unwrap_or_else(default_permission_mode),
                     enable_tools,
+                    continue_session,
                 });
             }
             "--print" => {
@@ -483,6 +499,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     allowed_tools,
                     permission_mode,
                     enable_tools,
+                    continue_session,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -506,6 +523,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allowed_tools,
                 permission_mode,
                 enable_tools,
+                continue_session,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -515,6 +533,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             enable_tools,
+            continue_session,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -523,6 +542,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             enable_tools,
+            continue_session,
         }),
     }
 }
@@ -613,6 +633,7 @@ fn parse_direct_slash_cli_action(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     enable_tools: bool,
+    continue_session: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -639,6 +660,7 @@ fn parse_direct_slash_cli_action(
                     allowed_tools,
                     permission_mode,
                     enable_tools,
+                    continue_session,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -3067,6 +3089,41 @@ impl LiveCli {
         Ok(cli)
     }
 
+    fn from_latest_session(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let handle = latest_managed_session()?;
+        let session = Session::load_from_path(&handle.path)?;
+        let session_id = session.session_id.clone();
+        let system_prompt = build_system_prompt()?;
+        let runtime = build_runtime(
+            session,
+            &handle.id,
+            model.clone(),
+            system_prompt.clone(),
+            enable_tools,
+            true,
+            allowed_tools.clone(),
+            permission_mode,
+            None,
+        )?;
+        Ok(Self {
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session: SessionHandle {
+                id: session_id,
+                path: handle.path,
+            },
+        })
+    }
+
     fn startup_banner(&self) -> String {
         let cwd = env::current_dir().map_or_else(
             |_| "<unknown>".to_string(),
@@ -3272,7 +3329,15 @@ impl LiveCli {
                 false
             }
             SlashCommand::Ultraplan { task } => {
-                self.run_ultraplan(task.as_deref())?;
+                let task = task
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("the current repo work");
+                let prompt = format!(
+                    "Produce a structured multi-step execution plan for the following task. Include: goals, risks, ordering, verification steps, and rollback. Be concise but complete.\n\nTask: {task}"
+                );
+                self.run_turn(&prompt)?;
                 false
             }
             SlashCommand::Teleport { target } => {
@@ -3897,11 +3962,6 @@ impl LiveCli {
 
     fn run_bughunter(&self, scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", format_bughunter_report(scope));
-        Ok(())
-    }
-
-    fn run_ultraplan(&self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_ultraplan_report(task));
         Ok(())
     }
 
@@ -6635,6 +6695,8 @@ struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// Persists `cd` across bash tool calls (each invocation still uses a new `sh -lc` process).
+    bash_session_cwd: PathBuf,
 }
 
 impl CliToolExecutor {
@@ -6650,7 +6712,46 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            bash_session_cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
+    }
+
+    fn refresh_bash_session_cwd(&mut self, command: &str) {
+        let head = command
+            .split("&&")
+            .next()
+            .unwrap_or(command)
+            .split(';')
+            .next()
+            .unwrap_or(command)
+            .trim();
+        if !head.to_ascii_lowercase().starts_with("cd") {
+            return;
+        }
+        let rest = head[2..].trim_start();
+        let target = rest.split_whitespace().next().unwrap_or("");
+        if target.is_empty() {
+            if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+                self.bash_session_cwd = PathBuf::from(home);
+            }
+            return;
+        }
+        if target == "-" {
+            return;
+        }
+        let path = target.trim_matches('"').trim_matches('\'');
+        if path == ".." {
+            if let Some(p) = self.bash_session_cwd.parent() {
+                self.bash_session_cwd = p.to_path_buf();
+            }
+            return;
+        }
+        let new_path = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            self.bash_session_cwd.join(path)
+        };
+        self.bash_session_cwd = fs::canonicalize(&new_path).unwrap_or(new_path);
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -6725,8 +6826,24 @@ impl ToolExecutor for CliToolExecutor {
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
+        let mut value: Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        if tool_name == "bash" {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "workingDirectory".to_string(),
+                    Value::String(self.bash_session_cwd.to_string_lossy().into_owned()),
+                );
+            }
+        }
+        let bash_cmd_snapshot = if tool_name == "bash" {
+            value
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(std::string::ToString::to_string)
+        } else {
+            None
+        };
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
@@ -6738,6 +6855,15 @@ impl ToolExecutor for CliToolExecutor {
         };
         match result {
             Ok(output) => {
+                if tool_name == "bash" {
+                    if let Ok(bash_out) = serde_json::from_str::<BashCommandOutput>(&output) {
+                        if bash_out.return_code_interpretation.is_none() && !bash_out.interrupted {
+                            if let Some(ref cmd) = bash_cmd_snapshot {
+                                self.refresh_bash_session_cwd(cmd);
+                            }
+                        }
+                    }
+                }
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
                     self.renderer
@@ -6885,6 +7011,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(
+        out,
+        "  --continue                 Continue the latest managed session (use with prompt / -p)"
+    )?;
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"
@@ -7464,6 +7594,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 enable_tools: true,
+                continue_session: false,
             }
         );
     }
@@ -7488,6 +7619,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 enable_tools: true,
+                continue_session: false,
             }
         );
     }
@@ -7511,6 +7643,26 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 enable_tools: true,
+                continue_session: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_continue_with_prompt_shorthand() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&["--continue".to_string(), "next".to_string(), "turn".to_string()])
+                .expect("args should parse"),
+            CliAction::Prompt {
+                prompt: "next turn".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                enable_tools: true,
+                continue_session: true,
             }
         );
     }
@@ -7668,6 +7820,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 enable_tools: true,
+                continue_session: false,
             }
         );
         assert_eq!(
@@ -7776,6 +7929,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 enable_tools: true,
+                continue_session: false,
             }
         );
     }
@@ -7841,6 +7995,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 enable_tools: true,
+                continue_session: false,
             }
         );
         assert_eq!(
@@ -7865,6 +8020,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 enable_tools: true,
+                continue_session: false,
             }
         );
         let error = parse_args(&["/status".to_string()])
