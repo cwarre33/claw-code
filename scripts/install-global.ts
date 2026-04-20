@@ -6,11 +6,40 @@
  * - `bun link --global` breaking when a bad package.json exists in the user home directory
  * - `bun install -g .` dependency-loop issues inside a Bun workspace
  */
-import { rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function persistedInstallJsonPath(): string | null {
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA?.trim();
+    if (!base) {
+      return null;
+    }
+    return join(base, "clawde", "install.json");
+  }
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  const configHome = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
+  return join(configHome, "clawde", "install.json");
+}
+
+async function writePersistedDevRoot(devRoot: string): Promise<void> {
+  const jsonPath = persistedInstallJsonPath();
+  if (!jsonPath) {
+    console.warn("Could not determine config path to save claw-code root (LOCALAPPDATA unset on Windows?).");
+    return;
+  }
+  const body = `${JSON.stringify({ devRoot: resolve(devRoot) }, null, 2)}\n`;
+  try {
+    await mkdir(dirname(jsonPath), { recursive: true });
+    await writeFile(jsonPath, body, "utf8");
+  } catch (err) {
+    console.warn("Could not write persisted dev root for global clawde:", err);
+  }
+}
 const pkgRoot = join(__dirname, "..", "packages", "claw-ui");
 
 const run = async (cwd: string, cmd: string, args: string[]) => {
@@ -44,8 +73,13 @@ try {
   // ignore cleanup failure
 }
 
+const clawCodeRoot = resolve(join(__dirname, ".."));
+await writePersistedDevRoot(clawCodeRoot);
+
 console.log(
   "\nDone. Open a new terminal and run: clawde\n" +
+    `Saved this checkout for Rust engine lookup: ${clawCodeRoot}\n` +
+    "  (If you move the repo, run install-global again from the new path, or set CLAW_DEV_ROOT.)\n" +
     "If the command is not found, ensure Bun's bin is on PATH, e.g.:\n" +
     "  Windows: %USERPROFILE%\\.bun\\bin\n" +
     "  macOS/Linux: $HOME/.bun/bin\n" +

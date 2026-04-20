@@ -7,14 +7,23 @@
  * - Dev fallback: `claw-code/rust/target/debug/claw(.exe)` next to this repo.
  * - Override: `CLAW_BINARY` = full path or name of the Rust CLI.
  * - Optional: `CLAW_DEV_ROOT` = path to `claw-code` (uses `rust/target/debug/claw(.exe)`).
+ * - After `bun run install-global`, a persisted `devRoot` is read from the user config dir
+ *   (same layout as `CLAW_DEV_ROOT`) so the Rust binary is found outside the checkout.
  * - If global Bun sets cwd to `.../node_modules/clawde`, set `CLAW_CWD` to your project
  *   or rely on `PWD` / `INIT_CWD` when your shell exports them.
+ * - After the nearest cwd `.env`, keys still unset are filled from `claw-code/.env` using the
+ *   same checkout root as engine discovery (`CLAW_DEV_ROOT`, persisted install path, etc.).
  *
  * First message starts a new session; later turns use `--continue` against `.claw/sessions/`.
+ *
+ * Headless runs pass `--dangerously-skip-permissions` so tool approval never reads stdin
+ * (Bun has no interactive TTY for the child). Set `CLAWDE_RESPECT_PROJECT_PERMISSIONS=1` to use
+ * the current directory's project permission mode instead (prompts will not work from clawde).
  */
 import * as p from "@clack/prompts";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const thisCliPath = resolve(fileURLToPath(import.meta.url));
@@ -149,6 +158,52 @@ function loadNearestDotenv(): void {
   }
 }
 
+/** `.../rust/target/debug/claw.exe` → `claw-code` root (four parents). */
+function clawExePathToDevRoot(exePath: string): string {
+  let d = exePath;
+  for (let i = 0; i < 4; i++) {
+    d = dirname(d);
+  }
+  return d;
+}
+
+/**
+ * Checkout root for loading repo `.env` (aligned with `resolveEngine` discovery).
+ * Fills env vars still unset after `loadNearestDotenv()` so global `clawde` picks up
+ * `claw-code/.env` when the shell cwd is another project.
+ */
+function getClawCodeRootForDotenv(): string | null {
+  const fromEnv = process.env.CLAW_DEV_ROOT?.trim();
+  if (fromEnv) {
+    const abs = resolve(fromEnv);
+    if (isExistingDir(abs)) {
+      return abs;
+    }
+  }
+  const persisted = readPersistedDevRoot();
+  if (persisted) {
+    return persisted;
+  }
+  const exeWalk = findRustClawInAncestorTree(process.cwd());
+  if (exeWalk) {
+    return clawExePathToDevRoot(exeWalk);
+  }
+  const guess = devRustClawGuess();
+  if (guess) {
+    return clawExePathToDevRoot(guess);
+  }
+  return null;
+}
+
+function loadDevRootDotenv(): void {
+  const root = getClawCodeRootForDotenv();
+  if (!root) {
+    return;
+  }
+  mergeEnvFile(resolve(root, ".env"));
+  mergeEnvFile(resolve(root, ".env.local"));
+}
+
 /** Rust `claw` uses `HOME` for config; Windows often only sets `USERPROFILE`. */
 function ensureHomeFromUserProfile(): void {
   if (process.env.HOME?.trim()) {
@@ -169,6 +224,7 @@ function ensureHomeFromUserProfile(): void {
 ensureHomeFromUserProfile();
 resolveWorkspaceCwdAndChdir();
 loadNearestDotenv();
+loadDevRootDotenv();
 ensureHomeFromUserProfile();
 
 /**
@@ -224,8 +280,71 @@ function isRustClawPath(candidate: string): boolean {
   return true;
 }
 
+function clawExeBasename(): string {
+  return process.platform === "win32" ? "claw.exe" : "claw";
+}
+
+/** `rust/target/{debug,release}/claw(.exe)` under a `claw-code` root. */
+function tryDevRoot(devRoot: string): string | null {
+  const exe = clawExeBasename();
+  const debugPath = resolve(devRoot, "rust", "target", "debug", exe);
+  if (existsSync(debugPath)) {
+    return debugPath;
+  }
+  const releasePath = resolve(devRoot, "rust", "target", "release", exe);
+  if (existsSync(releasePath)) {
+    return releasePath;
+  }
+  return null;
+}
+
+function persistedInstallJsonPath(): string | null {
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA?.trim();
+    if (!base) {
+      return null;
+    }
+    return join(base, "clawde", "install.json");
+  }
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  const configHome = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
+  return join(configHome, "clawde", "install.json");
+}
+
+/** Dev root written by `scripts/install-global.ts` (overridable via `CLAW_DEV_ROOT`). */
+function readPersistedDevRoot(): string | null {
+  const jsonPath = persistedInstallJsonPath();
+  if (!jsonPath || !existsSync(jsonPath)) {
+    return null;
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(jsonPath, "utf8");
+  } catch {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const dr = (parsed as { devRoot?: unknown }).devRoot;
+  if (typeof dr !== "string" || dr.trim().length === 0) {
+    return null;
+  }
+  const abs = resolve(dr.trim());
+  if (!isExistingDir(abs)) {
+    return null;
+  }
+  return abs;
+}
+
 function devRustClawGuess(): string | null {
-  const exe = process.platform === "win32" ? "claw.exe" : "claw";
+  const exe = clawExeBasename();
   const guess = resolve(
     dirname(fileURLToPath(import.meta.url)),
     "..",
@@ -241,7 +360,7 @@ function devRustClawGuess(): string | null {
 
 /** Walk up from `startDir` looking for `rust/target/{debug,release}/claw(.exe)` (checkout layout). */
 function findRustClawInAncestorTree(startDir: string): string | null {
-  const exe = process.platform === "win32" ? "claw.exe" : "claw";
+  const exe = clawExeBasename();
   const rels = [
     ["rust", "target", "debug", exe],
     ["rust", "target", "release", exe],
@@ -284,14 +403,16 @@ function resolveEngine(): string {
   }
   const devRoot = process.env.CLAW_DEV_ROOT?.trim();
   if (devRoot) {
-    const exe = process.platform === "win32" ? "claw.exe" : "claw";
-    const debugPath = resolve(devRoot, "rust", "target", "debug", exe);
-    if (existsSync(debugPath)) {
-      return debugPath;
+    const fromEnvRoot = tryDevRoot(resolve(devRoot));
+    if (fromEnvRoot) {
+      return fromEnvRoot;
     }
-    const releasePath = resolve(devRoot, "rust", "target", "release", exe);
-    if (existsSync(releasePath)) {
-      return releasePath;
+  }
+  const persistedRoot = readPersistedDevRoot();
+  if (persistedRoot) {
+    const fromPersisted = tryDevRoot(persistedRoot);
+    if (fromPersisted) {
+      return fromPersisted;
     }
   }
   const fromWalk = findRustClawInAncestorTree(process.cwd());
@@ -318,9 +439,17 @@ function engineExecutableOk(cmd: string): boolean {
   return Bun.which(cmd) !== null;
 }
 
+function clawdeRespectsProjectPermissions(): boolean {
+  const v = process.env.CLAWDE_RESPECT_PROJECT_PERMISSIONS?.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
 function buildArgs(line: string, useContinue: boolean): string[] {
   const trimmed = line.trim();
   const args = ["--output-format", "json"];
+  if (!clawdeRespectsProjectPermissions()) {
+    args.push("--dangerously-skip-permissions");
+  }
   if (useContinue) {
     args.push("--continue");
   }
@@ -470,10 +599,11 @@ async function main(): Promise<void> {
       `Rust CLI not found: "${engine}"\n` +
         `  Build once:  cd claw-code\\rust  &&  cargo build -p rusty-claude-cli\n` +
         `  Then either:\n` +
+        `    • From claw-code root run:  bun run install-global  (saves checkout path for engine lookup), or\n` +
         `    • cd into your claw-code checkout (clawde finds rust\\target\\debug\\${exe} automatically), or\n` +
         `    • $env:CLAW_BINARY = "${example}"\n` +
         `    • $env:CLAW_DEV_ROOT = "C:\\path\\to\\claw-code"\n` +
-        `  Update the global clawde UI from repo root:  bun run install-global`,
+        `  If you moved the repo, run install-global again from the new path.`,
     );
     process.exit(1);
   }

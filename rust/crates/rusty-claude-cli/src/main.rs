@@ -668,6 +668,15 @@ fn parse_direct_slash_cli_action(
                 }),
             }
         }
+        Ok(Some(SlashCommand::Ultraplan { task })) => Ok(CliAction::Prompt {
+            prompt: ultraplan_prompt_from_task(task.as_deref()),
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+            enable_tools,
+            continue_session,
+        }),
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
             let _ = command;
@@ -3329,14 +3338,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Ultraplan { task } => {
-                let task = task
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("the current repo work");
-                let prompt = format!(
-                    "Produce a structured multi-step execution plan for the following task. Include: goals, risks, ordering, verification steps, and rollback. Be concise but complete.\n\nTask: {task}"
-                );
+                let prompt = ultraplan_prompt_from_task(task.as_deref());
                 self.run_turn(&prompt)?;
                 false
             }
@@ -4888,6 +4890,17 @@ fn format_bughunter_report(scope: Option<&str>) -> String {
   Action           inspect the selected code for likely bugs and correctness issues
   Output           findings should include file paths, severity, and suggested fixes",
         scope.unwrap_or("the current repository")
+    )
+}
+
+/// Same prompt text as the REPL `/ultraplan` command; used for direct CLI and JSON one-shot.
+fn ultraplan_prompt_from_task(task: Option<&str>) -> String {
+    let task = task
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("the current repo work");
+    format!(
+        "Produce a structured multi-step execution plan for the following task. Include: goals, risks, ordering, verification steps, and rollback. Be concise but complete.\n\nTask: {task}"
     )
 }
 
@@ -7097,7 +7110,7 @@ mod tests {
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        format_ultraplan_report, format_unknown_slash_command, ultraplan_prompt_from_task,
         format_unknown_slash_command_message, format_user_visible_api_error,
         normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
@@ -8027,6 +8040,30 @@ mod tests {
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("claw --resume SESSION.jsonl /status"));
+    }
+
+    #[test]
+    fn direct_ultraplan_slash_parses_to_prompt_json() {
+        let prompt = ultraplan_prompt_from_task(Some("ship the release"));
+        assert!(prompt.contains("ship the release"));
+        assert!(prompt.contains("multi-step"));
+        assert_eq!(
+            parse_args(&[
+                "--output-format".to_string(),
+                "json".to_string(),
+                "/ultraplan ship the release".to_string(),
+            ])
+            .expect("/ultraplan should map to Prompt"),
+            CliAction::Prompt {
+                prompt,
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Json,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
+                enable_tools: true,
+                continue_session: false,
+            }
+        );
     }
 
     #[test]

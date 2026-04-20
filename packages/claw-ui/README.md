@@ -4,7 +4,7 @@ Interactive shell for the Claw agent: [@clack/prompts](https://github.com/natemo
 
 ## Global command: `clawde`
 
-After a **one-time** global link, you can run **`clawde`** from any directory.
+After a **one-time** global install from your checkout (`bun run install-global`), you can run **`clawde`** from any directory. That command records the checkout path so the Rust `claw` binary is found under `rust/target/...` even when your shell cwd is elsewhere. If you **move** the repo, run **`bun run install-global`** again from the new location (or set `CLAW_DEV_ROOT` / `CLAW_BINARY`).
 
 ### Install once (from this repo)
 
@@ -61,7 +61,9 @@ $env:CLAW_BINARY = "C:\Users\YOU\CleanDevEnvironment\Passion\ClawCode\claw-code\
 clawde
 ```
 
-The UI shows **Claw** in the header (not `clawde`) and prints **`Rust CLI: …`** at startup with the full path to the engine. If you build with `cargo build` in `claw-code/rust`, that path is detected automatically even when `claw` is not on your PATH.
+The UI shows **Claw** in the header (not `clawde`) and prints **`Rust CLI: …`** at startup with the full path to the engine. If you build with `cargo build` in `claw-code/rust`, that path is detected automatically when you run **`bun run install-global`** once from `claw-code` (it saves the checkout in `%LOCALAPPDATA%\clawde\install.json` on Windows, or `$XDG_CONFIG_HOME/clawde/install.json` / `~/.config/clawde/install.json` on Unix), even if `claw` is not on your `PATH`.
+
+When your shell is in **another** directory, `clawde` still merges **`claw-code/.env`** (and `.env.local`) for any variables not already set by your shell or by the nearest `.env` walking up from the current directory—so API keys and `ANTHROPIC_*` / proxy settings in the checkout apply without copying them into every project.
 
 ## Run without global install
 
@@ -81,7 +83,8 @@ bun run src/cli.ts
 
 - First message starts a **new** session under `.claw/sessions/`.
 - Later messages use **`--continue`** against the latest managed session.
-- Input starting with **`/`** is passed as a slash CLI argument (e.g. `/help`), not as `-p` text.
+- Input starting with **`/`** is passed as a slash CLI argument (e.g. `/help`, `/ultraplan …`), not as `-p` text. Slash commands that the Rust CLI implements as a single model turn (including **`/ultraplan`**) work from `clawde` the same as `claw --output-format json …`.
+- By default, `clawde` passes **`--dangerously-skip-permissions`** to `claw` (same effect as full danger mode: no stdin approval prompts) so multi-tool turns are not blocked headless. To use each repo’s configured permission mode instead, set **`CLAWDE_RESPECT_PROJECT_PERMISSIONS=1`** (tool prompts still cannot be answered from `clawde`).
 
 ## Troubleshooting
 
